@@ -95,6 +95,7 @@ bool SettingsStore::load(AppConfig& config)
     config.system.region = doc["system"]["region"] | "Asia/Tokyo";
     config.system.utcOffsetMinutes = doc["system"]["utcOffsetMinutes"] | 540;
     config.system.ntpServer = doc["system"]["ntpServer"] | "pool.ntp.org";
+    config.system.sshAutoConnect = doc["system"]["sshAutoConnect"] | true;
     config.activeWifi = doc["activeWifi"] | 0;
     config.activeSsh = doc["activeSsh"] | 0;
     if (config.activeWifi >= config.wifi.size()) {
@@ -147,6 +148,7 @@ bool SettingsStore::save(const AppConfig& config)
     doc["system"]["region"] = config.system.region;
     doc["system"]["utcOffsetMinutes"] = config.system.utcOffsetMinutes;
     doc["system"]["ntpServer"] = config.system.ntpServer;
+    doc["system"]["sshAutoConnect"] = config.system.sshAutoConnect;
     doc["activeWifi"] = config.activeWifi;
     doc["activeSsh"] = config.activeSsh;
 

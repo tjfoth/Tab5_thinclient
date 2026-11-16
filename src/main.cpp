@@ -242,6 +242,8 @@ bool connectSshProfile(const SshProfile& profile);
 bool parseSshCommand(const String& line, SshProfile& profile, String& error);
 void inheritSavedSshCredentials(SshProfile& profile);
 void connectActiveSsh();
+void setSshAutoConnect(bool enabled);
+bool powerCommand(const String& lowerCommand, String& result);
 void pollSshConnectJob();
 bool parseTrailingIndex(const String& command, size_t prefixLen, size_t& index);
 void configureTerminal();
@@ -2390,7 +2392,8 @@ void appendCliHelp()
     appendCliLine("  help, man <command>, clear, status, history");
     appendCliLine("  uname, whoami, hostname, date, uptime, echo");
     appendCliLine("  wifi status, wifi list, wifi off, wifi on, ip addr");
-    appendCliLine("  ssh list, ssh connect <index>, ssh disconnect");
+    appendCliLine("  ssh list, ssh connect <index>, ssh disconnect, ssh auto [on|off]");
+    appendCliLine("  power, power charge on|off");
     appendCliLine("  ssh user@host[:port] [password]");
     appendCliLine("  sd status, df, ls [-lah] [path], cat <path>, chmod <mode> <path>");
     appendCliLine("  mkdir <path>, rmdir <path>, rm <path>, cp <src> <dst>");
@@ -2495,6 +2498,16 @@ bool appendCliMan(const String& topic)
         appendCliLine("  ssh demo@192.0.2.10");
         appendCliLine("SEE ALSO");
         appendCliLine("  ssh connect, ssh disconnect");
+        return true;
+    }
+    if (key == "power") {
+        appendCliManEntry("power", "power [charge on|off]",
+                          "Show battery voltage, current, level and charge state; turn battery charging on or off until restart.");
+        return true;
+    }
+    if (key == "ssh auto") {
+        appendCliManEntry("ssh auto", "ssh auto [on|off]",
+                          "Show or set whether the active SSH profile connects when Wi-Fi comes up (boot and Wi-Fi reconnect).");
         return true;
     }
     if (key == "ssh connect") {
@@ -5349,6 +5362,24 @@ bool handleTab5CliCommand(const String& line)
         appendSshList();
         return true;
     }
+    if (lower == "power" || lower.startsWith("power ")) {
+        String result;
+        powerCommand(lower, result);
+        appendCliLine(result);
+        return true;
+    }
+    if (lower == "ssh auto" || lower.startsWith("ssh auto ")) {
+        String arg = lower.substring(strlen("ssh auto"));
+        arg.trim();
+        if (arg == "on" || arg == "off") {
+            setSshAutoConnect(arg == "on");
+        } else if (arg.length()) {
+            appendCliLine("usage: ssh auto [on|off]");
+            return true;
+        }
+        appendCliLine(String("ssh auto-connect ") + (config.system.sshAutoConnect ? "on" : "off"));
+        return true;
+    }
     if (lower == "ssh disconnect") {
         resetStorageBridgeState();
         ssh.disconnect();
@@ -5887,7 +5918,7 @@ void startWifiReconnect(uint32_t timeoutMs)
     if (!ForceFixedWifiForTest && activeWifi >= config.wifi.size()) {
         activeWifi = 0;
     }
-    autoSshConnectPending = !config.ssh.empty();
+    autoSshConnectPending = config.system.sshAutoConnect && !config.ssh.empty();
     setWifiStatus(ForceFixedWifiForTest ? "Wi-Fi direct test" : "Wi-Fi reconnect");
     appendWifiProgress(ForceFixedWifiForTest ? "Wi-Fi direct test" : "Wi-Fi reconnect");
     beginWifiAttempt(ForceFixedWifiForTest ? 0 : activeWifi);
@@ -6232,6 +6263,70 @@ void setSshFieldValue(uint8_t field, const String& value)
     if (field == 5) p.terminal = value.length() ? value : "xterm-256color";
 }
 
+const char* chargeStateName(m5::charge_state_t state)
+{
+    using cs = m5::charge_state_t;
+    switch (state) {
+        case cs::not_initialized: return "not_initialized";
+        case cs::io_error: return "io_error";
+        case cs::undetermined: return "undetermined";
+        case cs::unsupported: return "unsupported";
+        case cs::charging: return "charging";
+        case cs::not_charging: return "not_charging";
+        case cs::full: return "full";
+        case cs::disabled: return "disabled";
+        case cs::discharging: return "discharging";
+        case cs::idle: return "idle";
+    }
+    return "unknown";
+}
+
+// Charging enable as last set by "power charge"; the firmware does not touch it otherwise.
+const char* powerChargeSetting = "default";
+
+String powerReport()
+{
+    char line[200];
+    snprintf(line, sizeof(line), "battery=%dmV current=%ldmA level=%ld%% state=%s vbus=%dmV charge=%s",
+             static_cast<int>(M5.Power.getBatteryVoltage()),
+             static_cast<long>(M5.Power.getBatteryCurrent()),
+             static_cast<long>(M5.Power.getBatteryLevel()),
+             chargeStateName(M5.Power.getChargeState()),
+             static_cast<int>(M5.Power.getVBUSVoltage()),
+             powerChargeSetting);
+    return String(line);
+}
+
+// Handles "power" and "power charge on|off". Returns false with usage text in result on bad input.
+bool powerCommand(const String& lowerCommand, String& result)
+{
+    String arg = lowerCommand.substring(strlen("power"));
+    arg.trim();
+    if (arg.length()) {
+        if (arg != "charge on" && arg != "charge off") {
+            result = "usage: power [charge on|off]";
+            return false;
+        }
+        const bool enable = arg == "charge on";
+        if (!M5.Power.setBatteryCharge(enable)) {
+            result = "power charge: setBatteryCharge failed";
+            return false;
+        }
+        powerChargeSetting = enable ? "on" : "off";
+    }
+    result = powerReport();
+    return true;
+}
+
+void setSshAutoConnect(bool enabled)
+{
+    config.system.sshAutoConnect = enabled;
+    if (!enabled) {
+        autoSshConnectPending = false;
+    }
+    saveConfig();
+}
+
 String configFieldValue(uint8_t field)
 {
     if (field == 0) return config.system.deviceName;
@@ -6248,6 +6343,7 @@ String configFieldValue(uint8_t field)
     }
     if (field == 9) return "scan now";
     if (field == 10) return "pair selected";
+    if (field == 12) return config.system.sshAutoConnect ? "on" : "off";
     return "forget paired";
 }
 
@@ -6270,13 +6366,18 @@ void setConfigFieldValue(uint8_t field, const String& value)
     if (field == 6) config.keyboard.bleKeyboardName = value;
     if (field == 7) config.keyboard.bleKeyboardAddress = value;
     if (field == 8) blePairTarget = static_cast<size_t>(max<int>(0, value.toInt()));
+    if (field == 12) {
+        String enabled = value;
+        enabled.toLowerCase();
+        config.system.sshAutoConnect = enabled == "on" || enabled == "1" || enabled == "yes" || enabled == "true";
+    }
 }
 
 uint8_t editFieldCount()
 {
     if (screen == Screen::WifiEdit) return 3;
     if (screen == Screen::SshEdit) return 6;
-    if (screen == Screen::ConfigEdit) return 12;
+    if (screen == Screen::ConfigEdit) return 13;
     return 0;
 }
 
@@ -6422,6 +6523,10 @@ void toggleChoiceEditField()
     if (editField == 4) {
         config.keyboard.layout = config.keyboard.layout == "jp" ? "us" : "jp";
         editCursor = config.keyboard.layout.length();
+    } else if (editField == 12) {
+        setSshAutoConnect(!config.system.sshAutoConnect);
+        appendStatus(String("SSH auto-connect ") + (config.system.sshAutoConnect ? "on" : "off"));
+        editCursor = configFieldValue(editField).length();
     } else if (editField >= 5) {
         executeConfigBleAction(editField);
         return;
@@ -6623,7 +6728,8 @@ void drawEditFields(const char* title, const char* const* labels, uint8_t count,
         if (screen == Screen::WifiEdit) rawValue = wifiFieldValue(i);
         else if (screen == Screen::SshEdit) rawValue = sshFieldValue(i);
         else rawValue = configFieldValue(i);
-        bool secret = (screen == Screen::SshEdit && i == 4) || (screen == Screen::WifiEdit && i == 2);
+        // Passwords show as stars, except while their field is selected for editing.
+        bool secret = ((screen == Screen::SshEdit && i == 4) || (screen == Screen::WifiEdit && i == 2)) && i != editField;
         bool choiceField = screen == Screen::ConfigEdit && (i == 4 || i == 5 || i >= 8);
         String value = safeValue(rawValue, secret);
         size_t cursor = (i == editField && !choiceField) ? min(editCursor, rawValue.length()) : rawValue.length();
@@ -6718,8 +6824,9 @@ void draw()
     } else if (screen == Screen::ConfigEdit) {
         static const char* const labels[] = {"Device",     "Region",   "UTC min",    "NTP",
                                              "Keymap",     "BLE KB",   "BLE Name",   "BLE Addr",
-                                             "BLE Target", "BLE Scan", "BLE Pair",   "BLE Forget"};
-        drawEditFields("Config", labels, 12, false);
+                                             "BLE Target", "BLE Scan", "BLE Pair",   "BLE Forget",
+                                             "SSH Auto"};
+        drawEditFields("Config", labels, 13, false);
     } else if (screen == Screen::FontList) {
         drawFontList();
     }
@@ -7844,6 +7951,8 @@ void serialPrintHelp()
     Serial.println("  wifi off");
     Serial.println("  wifi on");
     Serial.println("  ssh list");
+    Serial.println("  ssh auto [on|off]");
+    Serial.println("  power [charge on|off]");
     Serial.println("  ssh active <index>");
     Serial.println("  ssh connect [index]");
     Serial.println("  ssh send <text>");
@@ -7863,13 +7972,14 @@ void serialPrintHelp()
 
 void serialPrintStatus()
 {
-    Serial.printf("screen=%u wifi=%s wl=%d ssh=%s activeWifi=%u activeSsh=%u keymap=%s sd=%s keyboard=%s ble=%s stage=%s\r\n",
+    Serial.printf("screen=%u wifi=%s wl=%d ssh=%s activeWifi=%u activeSsh=%u sshAuto=%s keymap=%s sd=%s keyboard=%s ble=%s stage=%s\r\n",
                   static_cast<unsigned>(screen),
                   wifiStatusText.c_str(),
                   static_cast<int>(WiFi.status()),
                   ssh.connected() ? "connected" : "disconnected",
                   static_cast<unsigned>(activeWifi),
                   static_cast<unsigned>(activeSsh),
+                  config.system.sshAutoConnect ? "on" : "off",
                   config.keyboard.layout.c_str(),
                   sdReady ? "ready" : sdLastError.c_str(),
                   keyboard.status().c_str(),
@@ -9678,6 +9788,23 @@ void handleSerialCommand(String command)
         Serial.println("OK wifi on");
     } else if (command == "ssh list") {
         serialPrintSshProfiles();
+    } else if (command == "power" || command.startsWith("power ")) {
+        String lower = command;
+        lower.toLowerCase();
+        String result;
+        bool ok = powerCommand(lower, result);
+        Serial.printf("%s %s\r\n", ok ? "OK" : "ERR", result.c_str());
+    } else if (command == "ssh auto" || command.startsWith("ssh auto ")) {
+        String arg = command.substring(strlen("ssh auto"));
+        arg.trim();
+        arg.toLowerCase();
+        if (arg == "on" || arg == "off") {
+            setSshAutoConnect(arg == "on");
+        } else if (arg.length()) {
+            Serial.println("ERR usage ssh auto [on|off]");
+            return;
+        }
+        Serial.printf("OK sshAuto=%s\r\n", config.system.sshAutoConnect ? "on" : "off");
     } else if (command.startsWith("ssh set ")) {
         std::vector<String> args = splitSerialArgs(command.substring(strlen("ssh set ")));
         if (args.size() < 3) {

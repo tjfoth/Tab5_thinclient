@@ -43,6 +43,7 @@ struct SystemConfig {
     String region{"Asia/Tokyo"};
     int16_t utcOffsetMinutes{540};
     String ntpServer{"pool.ntp.org"};
+    bool sshAutoConnect{true};  // connect to the active SSH profile when Wi-Fi comes up
 };
 
 struct AppConfig {
